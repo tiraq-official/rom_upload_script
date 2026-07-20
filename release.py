@@ -34,17 +34,22 @@ def get_latest_rom():
 def parse_rom_details(zip_path, device_codename):
     filename = os.path.basename(zip_path)
     
-    # 3. Detect ROM Name
-    rom_name = filename.split('-')[0]
-    version_match = re.search(rf"{rom_name}[-_]([\d\.]+)", filename, re.IGNORECASE)
+    # 3. Detect ROM Name & Version dynamically
+    # Captures everything up to the device name/status, and grabs the version number later in the string
+    if "-AOSP" in filename:
+        rom_name = filename.split('-')[0] + "-AOSP"
+    else:
+        rom_name = filename.split('-')[0]
+        
+    version_match = re.search(r"[-_]([\d\.]+)", filename)
     if version_match:
         rom_name = f"{rom_name} {version_match.group(1)}"
 
-    # 4. Detect OFFICIAL / UNOFFICIAL
-    if "OFFICIAL" in filename.upper():
-        build_type = "OFFICIAL"
-    elif "UNOFFICIAL" in filename.upper():
+    # 4. Detect OFFICIAL / UNOFFICIAL (Swapped order to prevent substring collision)
+    if "UNOFFICIAL" in filename.upper():
         build_type = "UNOFFICIAL"
+    elif "OFFICIAL" in filename.upper():
+        build_type = "OFFICIAL"
     else:
         build_type = "Unknown"
 
