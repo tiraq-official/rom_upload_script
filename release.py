@@ -7,9 +7,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 # ==================== CONFIGURATION ====================
-TELEGRAM_TOKEN = os.getenv("TG_BOT_TOKEN", "YOUR_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "YOUR_CHAT_ID")
-PRODUCT_DIR = "out/target/product"
+TELEGRAM_TOKEN = "8860525999:AAHb4taCWi12n82n2cEU8lhtMRMFOIcnBeE"
+TELEGRAM_CHAT_ID = "-1003927020988"
+PRODUCT_DIR = "../out/target/product"
 MAX_RETRIES = 3
 # =======================================================
 
