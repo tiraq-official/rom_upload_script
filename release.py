@@ -9,6 +9,7 @@ import requests
 # ==================== CONFIGURATION ====================
 TELEGRAM_TOKEN = "8860525999:AAHb4taCWi12n82n2cEU8lhtMRMFOIcnBeE"
 TELEGRAM_CHAT_ID = "-1003927020988"
+PIXELDRAIN_API_KEY = "02b47b2e-aea7-449c-a3a0-71bd4c1afa7c"
 PRODUCT_DIR = "../out/target/product"
 MAX_RETRIES = 3
 # =======================================================
@@ -17,25 +18,19 @@ def get_latest_rom():
     """1 & 2: Automatically find the newest ROM ZIP and detect codename folder."""
     search_path = os.path.join(PRODUCT_DIR, "*", "*.zip")
     zip_files = glob.glob(search_path)
-    
     if not zip_files:
         print("❌ Error: No ROM ZIP files found in out/target/product/*")
         exit(1)
-        
     # Sort by modification time to get the newest
     latest_zip = max(zip_files, key=os.path.getmtime)
-    
     # Extract codename from the path component right before the filename
     path_parts = os.path.normpath(latest_zip).split(os.sep)
     device_codename = path_parts[-2]
-    
     return latest_zip, device_codename
 
 def parse_rom_details(zip_path, device_codename):
     filename = os.path.basename(zip_path)
-    
     # 3. Detect ROM Name & Version dynamically
-    # Captures everything up to the device name/status, and grabs the version number later in the string
     if "-AOSP" in filename:
         rom_name = filename.split('-')[0] + "-AOSP"
     else:
@@ -72,7 +67,7 @@ def parse_rom_details(zip_path, device_codename):
                         break
             except Exception:
                 pass
-
+                
     # 6. Detect build date
     date_match = re.search(r"(20\d{6})", filename)
     if date_match:
@@ -88,7 +83,6 @@ def parse_rom_details(zip_path, device_codename):
     bytes_size = os.path.getsize(zip_path)
     gb_size = bytes_size / (1024 ** 3)
     file_size = f"{gb_size:.2f} GB"
-
     return {
         "filename": filename,
         "codename": device_codename,
@@ -100,80 +94,113 @@ def parse_rom_details(zip_path, device_codename):
     }
 
 def upload_file_to_gofile(file_path):
-    """8 & 9: Uploads a file directly to GoFile with automatic server detection and retries."""
+    """Uploads a file directly to GoFile with automatic server detection."""
     if not os.path.exists(file_path):
-        return os.path.basename(file_path), None
-
+        return None
     filename = os.path.basename(file_path)
     print(f"🚀 Starting GoFile upload: {filename}...")
-    
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            # Step 1: Query GoFile to find the best current available server
             server_res = requests.get("https://api.gofile.io/servers", timeout=15)
             server_res.raise_for_status()
             server_data = server_res.json()
-            
             if server_data.get("status") != "ok" or not server_data.get("data", {}).get("servers"):
-                raise Exception("Failed to retrieve an active GoFile server node.")
-                
-            # Pick the first available target server node
+                raise Exception("Failed to retrieve GoFile node.")
             target_server = server_data["data"]["servers"][0]["name"]
             upload_url = f"https://{target_server}.gofile.io/contents/uploadfile"
-            
-            # Step 2: Stream file up to the selected node
             with open(file_path, 'rb') as f:
                 upload_res = requests.post(upload_url, files={'file': f}, timeout=600)
-                
             upload_res.raise_for_status()
             upload_data = upload_res.json()
-            
             if upload_data.get("status") == "ok":
-                download_url = upload_data["data"]["downloadPage"]
-                print(f"✅ Successfully uploaded {filename} to GoFile!")
-                return filename, download_url
+                print(f"✅ GoFile completed: {filename}")
+                return upload_data["data"]["downloadPage"]
             else:
-                raise Exception(f"GoFile server rejected upload: {upload_data}")
-                
+                raise Exception(f"Server rejected: {upload_data}")
         except Exception as e:
-            print(f"⚠️ Attempt {attempt} failed for {filename}: {e}")
-            if attempt == MAX_RETRIES:
-                raise e
+            print(f"⚠️ GoFile attempt {attempt} failed for {filename}: {e}")
+            if attempt == MAX_RETRIES: raise e
             time.sleep(5)
 
+def upload_file_to_pixeldrain(file_path):
+    """Uploads a file to Pixeldrain using authorized User API Key authorization."""
+    if not os.path.exists(file_path):
+        return None
+    filename = os.path.basename(file_path)
+    print(f"🚀 Starting Pixeldrain upload: {filename}...")
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            upload_url = "https://pixeldrain.com/api/file"
+            with open(file_path, 'rb') as f:
+                # Pixeldrain accepts standard API key authorization via HTTP Basic Auth (username empty, password is key)
+                upload_res = requests.post(
+                    upload_url, 
+                    files={'file': f}, 
+                    auth=('', PIXELDRAIN_API_KEY),
+                    timeout=600
+                )
+            upload_res.raise_for_status()
+            upload_data = upload_res.json()
+            if upload_data.get("success") is True:
+                file_id = upload_data.get("id")
+                print(f"✅ Pixeldrain completed: {filename}")
+                return f"https://pixeldrain.com/u/{file_id}"
+            else:
+                raise Exception(f"Pixeldrain rejected: {upload_data}")
+        except Exception as e:
+            print(f"⚠️ Pixeldrain attempt {attempt} failed for {filename}: {e}")
+            if attempt == MAX_RETRIES: raise e
+            time.sleep(5)
+
+def upload_wrapper(file_path):
+    """Worker task designed to execute dual-hosting processing concurrently."""
+    filename = os.path.basename(file_path)
+    gofile_url = upload_file_to_gofile(file_path)
+    pixeldrain_url = upload_file_to_pixeldrain(file_path)
+    return filename, {"gofile": gofile_url or "N/A", "pixeldrain": pixeldrain_url or "N/A"}
+
 def upload_all_images(device_dir, rom_zip_path):
-    """Orchestrates parallel uploads of the ZIP and structural image assets."""
+    """Orchestrates multi-threaded mirror deployments."""
     files_to_upload = [
         rom_zip_path,
         os.path.join(device_dir, "boot.img"),
         os.path.join(device_dir, "dtbo.img"),
         os.path.join(device_dir, "vendor_boot.img")
     ]
-    
     existing_files = [f for f in files_to_upload if os.path.exists(f)]
     links = {}
     
+    # Process files concurrently (GoFile + Pixeldrain for each asset will process concurrently)
     with ThreadPoolExecutor(max_workers=4) as executor:
-        future_to_file = {executor.submit(upload_file_to_gofile, f): f for f in existing_files}
-        
+        future_to_file = {executor.submit(upload_wrapper, f): f for f in existing_files}
         for future in as_completed(future_to_file):
             file_path = future_to_file[future]
             try:
-                filename, url = future.result()
-                if url:
-                    links[filename] = url
+                filename, mirror_urls = future.result()
+                links[filename] = mirror_urls
             except Exception as e:
-                print(f"❌ Critical Error: Parallel upload completely failed for {os.path.basename(file_path)}.")
+                print(f"❌ Critical Error: Parallel upload pipeline failed for {os.path.basename(file_path)}.")
                 exit(1)
-                
     return links
 
 def send_telegram_notification(details, links):
-    """11: Formats and fires off the Telegram notification payload."""
-    rom_url = links.get(details["filename"], "N/A")
-    boot_url = next((v for k, v in links.items() if "boot.img" in k and "vendor" not in k), "N/A")
-    dtbo_url = next((v for k, v in links.items() if "dtbo.img" in k), "N/A")
-    vendor_boot_url = next((v for k, v in links.items() if "vendor_boot.img" in k), "N/A")
+    """Generates dual-link release posts and signals Telegram."""
+    
+    # Helper extract logic safely reading nested dictionary keys
+    def get_links_str(target_name):
+        match_key = next((k for k in links.keys() if target_name in k), None)
+        # Handle strict filtering separation logic distinguishing between boot & vendor_boot
+        if target_name == "boot.img":
+            match_key = next((k for k in links.keys() if "boot.img" in k and "vendor" not in k), None)
+            
+        if match_key and links[match_key]["gofile"] != "N/A":
+            return f"🔗 [GoFile]({links[match_key]['gofile']}) | [Pixeldrain]({links[match_key]['pixeldrain']})"
+        return "N/A"
+
+    rom_links = get_links_str(details["filename"])
+    boot_links = get_links_str("boot.img")
+    dtbo_links = get_links_str("dtbo.img")
+    vendor_boot_links = get_links_str("vendor_boot.img")
 
     message = (
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -185,21 +212,16 @@ def send_telegram_notification(details, links):
         f"📅 *Build*   : `{details['date']}`\n"
         f"💾 *Size*    : `{details['size']}`\n\n"
         "⬇ *Downloads*\n\n"
-        f"📦 *ROM*\n{rom_url}\n\n"
-        f"💿 *Boot*\n{boot_url}\n\n"
-        f"📀 *DTBO*\n{dtbo_url}\n\n"
-        f"⚙ *Vendor Boot*\n{vendor_boot_url}\n\n"
+        f"📦 *ROM*\n{rom_links}\n\n"
+        f"💿 *Boot*\n{boot_links}\n\n"
+        f"📀 *DTBO*\n{dtbo_links}\n\n"
+        f"⚙ *Vendor Boot*\n{vendor_boot_links}\n\n"
         f"#{details['codename']} #Android{details['android']}\n"
         "━━━━━━━━━━━━━━━━━━━━━━"
     )
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True}
     res = requests.post(url, json=payload)
     if res.status_code == 200:
         print("📢 Telegram notification sent successfully!")
@@ -210,17 +232,16 @@ def main():
     print("🔍 Scanning for builds...")
     rom_zip, codename = get_latest_rom()
     device_dir = os.path.dirname(rom_zip)
-    
     print(f"📦 Found newest ROM: {rom_zip} ({codename})")
     details = parse_rom_details(rom_zip, codename)
     
-    print("🚀 Uploading assets in parallel to GoFile...")
+    print("🚀 Uploading assets in parallel to GoFile & Pixeldrain...")
     uploaded_links = upload_all_images(device_dir, rom_zip)
     
     links_file = "release_links.txt"
     with open(links_file, "w") as f:
-        for fname, url in uploaded_links.items():
-            f.write(f"{fname}: {url}\n")
+        for fname, mirrors in uploaded_links.items():
+            f.write(f"{fname}:\n  GoFile: {mirrors['gofile']}\n  Pixeldrain: {mirrors['pixeldrain']}\n")
     print(f"📝 Saved links locally to {links_file}")
     
     send_telegram_notification(details, uploaded_links)
