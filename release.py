@@ -8,7 +8,7 @@ import requests
 
 # ==================== CONFIGURATION ====================
 TELEGRAM_TOKEN = "8860525999:AAHb4taCWi12n82n2cEU8lhtMRMFOIcnBeE"
-TELEGRAM_CHAT_ID = "-1003927020988"
+TELEGRAM_CHAT_ID = "-1003934445801"
 PIXELDRAIN_API_KEY = "02b47b2e-aea7-449c-a3a0-71bd4c1afa7c"
 PRODUCT_DIR = "../out/target/product"
 MAX_RETRIES = 3
