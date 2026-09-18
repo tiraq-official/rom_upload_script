@@ -25,12 +25,12 @@ import requests
 # ==================== CONFIGURATION ====================
 TELEGRAM_TOKEN = os.environ.get(
     "TELEGRAM_TOKEN",
-    "8860525999:AAHb4taCWi12n82n2cEU8lhtMRMFOIcnBeE"
+    "8860525999:AAFLlMQa0eeuKoamBapct3YJAClTVD_Eqwc"
 )
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1003934445801")
 PIXELDRAIN_API_KEY = os.environ.get(
     "PIXELDRAIN_API_KEY",
-    "02b47b2e-aea7-449c-a3a0-71bd4c1afa7c"
+    "2dfa58b9-27f1-4fb7-b0e6-ba5590fd2ce2"
 )
 
 # Targeted device
