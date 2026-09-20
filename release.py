@@ -4,19 +4,30 @@ Targeted release script for Moto G34/G45 5G (fogos).
 
 After a successful ROM build:
   1. Finds the newest ROM zip in out/target/product/fogos that belongs to one
-     of the maintained ROMs (Axion OS, Lunaris OS, Voltage OS, Pixel OS).
-  2. Uploads the ROM + boot/dtbo/vendor_boot images to GoFile and Pixeldrain.
+     of the maintained ROMs (Axion OS, Lunaris OS, Voltage OS, Pixelify OS).
+  2. Uploads the ROM + boot/dtbo/vendor_boot images to GoFile and Pixeldrain,
+     and additionally uploads the ROM zip to SourceForge (permanent storage,
+     via rsync) into the ROM's own folder.
   3. Posts a clean release message to Telegram.
+
+SourceForge setup needed on the build machine:
+  - Your SourceForge username in SOURCEFORGE_USER below (or the
+    SOURCEFORGE_USER environment variable).
+  - An SSH key registered at SourceForge (Account > SSH Settings), so rsync
+    can log in without a password prompt.
 
 NOTE: Tokens/keys can be overridden with environment variables so you don't
 have to keep them in this file:
-    TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, PIXELDRAIN_API_KEY
+    TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, PIXELDRAIN_API_KEY,
+    SOURCEFORGE_USER, SOURCEFORGE_PROJECT
 """
 
 import os
 import re
 import glob
 import time
+import subprocess
+from urllib.parse import quote
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -33,19 +44,37 @@ PIXELDRAIN_API_KEY = os.environ.get(
     "2dfa58b9-27f1-4fb7-b0e6-ba5590fd2ce2"
 )
 
+# SourceForge permanent storage (rsync)
+# Uploads land in: /home/frs/project/<project>/<base path>/<rom folder>/
+SOURCEFORGE_USER = os.environ.get("SOURCEFORGE_USER", "tiraq")
+SOURCEFORGE_PROJECT = os.environ.get("SOURCEFORGE_PROJECT", "orb-of-fortune-teller")
+SOURCEFORGE_BASE_PATH = os.environ.get("SOURCEFORGE_BASE_PATH", "fogos")
+
 # Targeted device
 DEVICE_NAME = "Moto G34/G45 5G (fogos)"
 PRODUCT_DIR = "../out/target/product/fogos"
 
-# ROMs we maintain: display name -> keyword matched against the filename.
-# The filename is normalized first (lowercase, all spaces/dots/dashes/
-# underscores stripped) so "Lunaris OS", "LunarisOS", "lunaris_os",
-# "Lunaris-OS" etc. all match the keyword "lunaris".
+# ROMs we maintain. Filenames are normalized first (lowercase, all spaces/
+# dots/dashes/underscores stripped), so "LunarisOS", "Lunaris OS",
+# "lunaris_os", "Lunaris-OS" etc. all match the keyword "lunaris".
+# Each ROM also maps to its SourceForge folder inside the project.
 SUPPORTED_ROMS = {
-    "Axion OS": "axion",
-    "Lunaris OS": "lunaris",
-    "Voltage OS": "voltage",
-    "Pixel OS": "pixelos",
+    "Axion OS": {
+        "keywords": ["axion"],
+        "sf_folder": "axion",
+    },
+    "Lunaris OS": {
+        "keywords": ["lunaris"],
+        "sf_folder": "lunaris",
+    },
+    "Voltage OS": {
+        "keywords": ["voltage"],
+        "sf_folder": "voltage",
+    },
+    "Pixelify OS": {
+        "keywords": ["pixelify", "ascp", "pixelos"],
+        "sf_folder": "pixelify",
+    },
 }
 
 MAX_RETRIES = 3
@@ -60,8 +89,8 @@ def normalize_name(text):
 def detect_rom(filename):
     """Return the display name if the file belongs to a maintained ROM, else None."""
     normalized = normalize_name(filename)
-    for display_name, keyword in SUPPORTED_ROMS.items():
-        if keyword in normalized:
+    for display_name, info in SUPPORTED_ROMS.items():
+        if any(keyword in normalized for keyword in info["keywords"]):
             return display_name
     return None
 
@@ -159,6 +188,69 @@ def parse_rom_details(zip_path, rom_display_name):
     }
 
 
+# ------------------- SourceForge (rsync) -------------------
+
+def sf_relative_path(sf_folder):
+    """Path inside the project files: <base path>/<rom folder> (e.g. fogos/lunaris)."""
+    base = SOURCEFORGE_BASE_PATH.strip("/")
+    return f"{base}/{sf_folder}" if base else sf_folder
+
+
+def sf_remote_path(sf_folder):
+    """rsync destination for a ROM folder on the SourceForge FRS."""
+    return (
+        f"{SOURCEFORGE_USER},{SOURCEFORGE_PROJECT}@frs.sourceforge.net"
+        f":/home/frs/project/{SOURCEFORGE_PROJECT}/{sf_relative_path(sf_folder)}/"
+    )
+
+
+def sf_download_url(sf_folder, filename):
+    """Permanent download URL of an uploaded file on SourceForge."""
+    return (
+        f"https://sourceforge.net/projects/{SOURCEFORGE_PROJECT}"
+        f"/files/{sf_relative_path(sf_folder)}/{quote(filename)}/download"
+    )
+
+
+def upload_rom_to_sourceforge(file_path, sf_folder):
+    """Upload the ROM zip to its SourceForge folder via rsync.
+
+    Returns the permanent download URL, or None if it failed (the release
+    post will then simply fall back to GoFile/Pixeldrain only).
+    """
+    filename = os.path.basename(file_path)
+    print(f"🚀 Starting SourceForge upload: {filename} -> {sf_folder}/ ...")
+    remote = sf_remote_path(sf_folder)
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            result = subprocess.run(
+                [
+                    "rsync",
+                    "-v",
+                    "--partial",
+                    "--progress",
+                    "-e", "ssh -o StrictHostKeyChecking=accept-new",
+                    file_path,
+                    remote,
+                ],
+            )
+            if result.returncode == 0:
+                print(f"✅ SourceForge completed: {filename}")
+                return sf_download_url(sf_folder, filename)
+            raise Exception(f"rsync exited with code {result.returncode}")
+        except FileNotFoundError:
+            print("❌ Error: rsync is not installed on this machine.")
+            return None
+        except Exception as e:
+            print(f"⚠️ SourceForge attempt {attempt} failed: {e}")
+            if attempt == MAX_RETRIES:
+                print("❌ SourceForge upload failed after all retries — continuing without it.")
+                return None
+            time.sleep(10)
+
+
+# ------------------- GoFile / Pixeldrain -------------------
+
 def upload_file_to_gofile(file_path):
     """Upload a file to GoFile with automatic server detection."""
     if not os.path.exists(file_path):
@@ -249,8 +341,11 @@ def upload_all_assets(device_dir, rom_zip_path):
     return links
 
 
+# ------------------- Telegram post -------------------
+
 def get_links_str(links, target_name):
-    """Build a 'GoFile • Pixeldrain' string for a file, using whatever mirrors succeeded."""
+    """Build a 'SourceForge • GoFile • Pixeldrain' string for a file,
+    using whatever mirrors are available."""
     keys = list(links.keys())
     if target_name == "boot.img":
         # Exclude vendor_boot.img so plain boot.img matches correctly
@@ -261,11 +356,14 @@ def get_links_str(links, target_name):
     if not match_key:
         return "Not available"
 
+    entry = links[match_key]
     parts = []
-    if links[match_key]["gofile"] != "N/A":
-        parts.append(f"[GoFile]({links[match_key]['gofile']})")
-    if links[match_key]["pixeldrain"] != "N/A":
-        parts.append(f"[Pixeldrain]({links[match_key]['pixeldrain']})")
+    if entry.get("sourceforge", "N/A") != "N/A":
+        parts.append(f"[SourceForge]({entry['sourceforge']})")
+    if entry.get("gofile", "N/A") != "N/A":
+        parts.append(f"[GoFile]({entry['gofile']})")
+    if entry.get("pixeldrain", "N/A") != "N/A":
+        parts.append(f"[Pixeldrain]({entry['pixeldrain']})")
     return " • ".join(parts) if parts else "Not available"
 
 
@@ -323,14 +421,25 @@ def main():
     print(f"📦 Found {rom_display_name} build: {os.path.basename(rom_zip)}")
 
     details = parse_rom_details(rom_zip, rom_display_name)
+    sf_folder = SUPPORTED_ROMS[rom_display_name]["sf_folder"]
 
-    print("🚀 Uploading assets in parallel to GoFile & Pixeldrain...")
-    uploaded_links = upload_all_assets(device_dir, rom_zip)
+    # Upload ROM to SourceForge in parallel with the GoFile/Pixeldrain uploads
+    print("🚀 Uploading assets in parallel (SourceForge + GoFile + Pixeldrain)...")
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        sf_future = executor.submit(upload_rom_to_sourceforge, rom_zip, sf_folder)
+        uploaded_links = upload_all_assets(device_dir, rom_zip)
+        sf_url = sf_future.result()
+
+    if sf_url:
+        uploaded_links.setdefault(details["filename"], {})["sourceforge"] = sf_url
+    else:
+        print("⚠️ Posting without a SourceForge link for this release.")
 
     links_file = "release_links.txt"
     with open(links_file, "w") as f:
         for fname, mirrors in uploaded_links.items():
-            f.write(f"{fname}:\n  GoFile: {mirrors['gofile']}\n  Pixeldrain: {mirrors['pixeldrain']}\n")
+            f.write(f"{fname}:\n  SourceForge: {mirrors.get('sourceforge', 'N/A')}\n")
+            f.write(f"  GoFile: {mirrors['gofile']}\n  Pixeldrain: {mirrors['pixeldrain']}\n")
     print(f"📝 Saved links locally to {links_file}")
 
     send_telegram_notification(details, uploaded_links)
