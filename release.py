@@ -48,6 +48,8 @@ except ImportError:
     _PIL_AVAILABLE = False
 
 # ==================== CONFIGURATION ====================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Fill these in here, or better: export them in your shell before running.
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8860525999:AAFLlMQa0eeuKoamBapct3YJAClTVD_Eqwc")          # <-- set me
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1003934445801")
@@ -67,7 +69,9 @@ ANDROID_VERSION_OVERRIDE = os.environ.get("ANDROID_VERSION_OVERRIDE", "")
 
 # Release image: one wallpaper is chosen at random from this folder, the ROM
 # name is stamped on it in white, and it is attached to the Telegram post.
-IMAGES_DIR = os.environ.get("IMAGES_DIR", "release_images")
+# Resolved next to release.py, not relative to the shell's cwd, so it works
+# no matter which directory you launch the script from.
+IMAGES_DIR = os.environ.get("IMAGES_DIR", os.path.join(SCRIPT_DIR, "release_images"))
 FONT_PATH = os.environ.get("FONT_PATH", "")  # custom .ttf; empty = auto-pick
 TEXT_Y_FRACTION = 0.5  # where the ROM name sits (0 = top, 1 = bottom)
 
@@ -358,8 +362,21 @@ def parse_filename(filename, device_slug=None):
     return {"name": name or None, "version": version, "android": android, "date": date}
 
 
-def detect_rom_token_version(props):
-    """Find (token, version) from a ROM-specific prop like ro.axion.version."""
+_ID_KEYS = (
+    "ro.build.display.id", "ro.build.flavor", "ro.product.build.flavor",
+    "ro.build.id", "ro.modversion", "ro.build.description",
+)
+
+
+def detect_rom_token_version(props, filename=None):
+    """Find (token, version) from a ROM-specific prop like ro.axion.version.
+
+    A token is only trusted when it really is this ROM's identity: it appears
+    in a build id / flavor / the zip name, or it has a sibling ro.<token>.*
+    prop. That is what stops system props such as ro.opengles.version=196610
+    from being mistaken for the ROM name.
+    """
+    haystack = " ".join([props.get(k, "") for k in _ID_KEYS] + [filename or ""]).lower()
     best = None
     for key, value in props.items():
         m = re.match(r"^ro\.([a-z0-9_]+)\.(?:build\.|display\.)?version$", key)
@@ -368,11 +385,12 @@ def detect_rom_token_version(props):
         token = m.group(1)
         if token in _TOKEN_EXCLUDE or not re.search(r"\d", value):
             continue
-        score = 0
-        if any(k.startswith(f"ro.{token}.") for k in props):
-            score += 1
-        if re.match(r"^\d", value):
-            score += 1
+        siblings = sum(1 for k in props if k.startswith(f"ro.{token}."))
+        in_haystack = token in haystack
+        if not in_haystack and siblings < 2:
+            continue  # looks like a system prop, not this ROM
+        score = (2 if in_haystack else 0) + (1 if siblings >= 2 else 0) \
+            + (1 if re.match(r"^\d", value) else 0)
         if best is None or score > best[0]:
             best = (score, token, value)
     if best:
@@ -380,50 +398,48 @@ def detect_rom_token_version(props):
     return None, None
 
 
+def _nice_brand(text):
+    if text and text.islower() and " " not in text:
+        return text.title()
+    return text
+
+
 def guess_brand(props, token, device_slug, filename=None):
-    """Pick a human ROM name out of the build ids / filename / prop values.
+    """Human ROM name.
 
-    Candidates are tried in order of trust: the build id/flavor props first,
-    then the zip filename, then any other prop that mentions the ROM token.
-    The first candidate that yields a match wins, so a clean build id is never
-    overridden by a noisier source.
+    With a trusted token we look for the word that carries it (AxionOS,
+    PixelOS ...). Without one, the zip name is the most reliable source, then
+    the build ids. Returns None when nothing usable is found, so the caller
+    can fall back to the manifest / filename.
     """
-    candidates = []
-    for key in ("ro.build.display.id", "ro.build.flavor", "ro.product.build.flavor",
-                "ro.build.id", "ro.modversion", "ro.build.description"):
-        if props.get(key):
-            candidates.append(props[key])
-    if filename:
-        candidates.append(re.sub(r"\.zip$", "", filename, flags=re.I))
-    if token:
-        for key, value in props.items():
-            if token in key.lower() or token in value.lower():
-                candidates.append(value)
-
     skip = set(_BRAND_SKIP)
     if device_slug:
         skip.add(device_slug.lower())
 
-    best_overall = None
-    for text in candidates:
-        bare = None
+    fname_brand = parse_filename(filename, device_slug)["name"] if filename else None
+    id_texts = [props.get(k, "") for k in _ID_KEYS]
+
+    if token:
+        for text in id_texts + [filename or ""]:
+            for word in re.findall(r"[A-Za-z][A-Za-z0-9\.]*", text):
+                wl = word.lower()
+                if wl in skip or re.match(r"^v?\d", wl):
+                    continue
+                if wl.startswith(token):
+                    return word if len(wl) > len(token) else _nice_brand(word)
+        if fname_brand and fname_brand.lower().replace(" ", "").startswith(token):
+            return _nice_brand(fname_brand)
+        return _nice_brand(token)
+
+    if fname_brand and fname_brand.lower() not in skip:
+        return _nice_brand(fname_brand)
+    for text in id_texts:
         for word in re.findall(r"[A-Za-z][A-Za-z0-9\.]*", text):
             wl = word.lower()
             if wl in skip or re.match(r"^v?\d", wl):
                 continue
-            if token:
-                if wl.startswith(token):
-                    if len(wl) > len(token):
-                        return word          # e.g. AxionOS / PixelOS / VoltageOS
-                    bare = bare or word
-            elif best_overall is None or len(word) > len(best_overall):
-                best_overall = word
-        if bare:
-            return bare.title() if bare.islower() else bare
-
-    if token:
-        return token.title()
-    return best_overall
+            return _nice_brand(word)
+    return None
 
 
 def extract_version_from_ids(props):
@@ -519,7 +535,7 @@ def detect_rom_details(zip_path, props, source_root):
     filename = os.path.basename(zip_path)
     device_slug = os.path.basename(os.path.normpath(PRODUCT_DIR)) or "fogos"
     fname = parse_filename(filename, device_slug)
-    token, token_version = detect_rom_token_version(props)
+    token, token_version = detect_rom_token_version(props, filename)
 
     name = ROM_NAME_OVERRIDE or guess_brand(props, token, device_slug, filename) \
         or manifest_brand(source_root, token) or fname["name"]
@@ -546,7 +562,15 @@ def find_latest_zip(product_dir):
     zips = glob.glob(os.path.join(product_dir, "*.zip"))
     if not zips:
         fail(f"No .zip files found in {product_dir}")
-    return max(zips, key=os.path.getmtime)
+
+    # Prefer the real ROM package and skip OTA / fastboot bundles -- the OTA
+    # zip is usually written last, so a plain newest-first pick grabs it.
+    def is_ota(path):
+        name = os.path.basename(path).lower()
+        return "ota" in name or name.endswith("-img.zip") or "fastboot" in name
+
+    rom_zips = [z for z in zips if not is_ota(z)]
+    return max(rom_zips or zips, key=os.path.getmtime)
 
 
 # ---------------------------------------------------------------- uploads
@@ -823,6 +847,30 @@ def build_header(details, include_banner=True):
     return lines
 
 
+def debug_report(props, details, zip_path, source_root):
+    """Dump exactly what was read and detected, to explain a bad post."""
+    print(f"\n  {paint('── debug ───────────────────────────────', C.DIM)}")
+    print(f"  zip         : {zip_path}")
+    print(f"  source root : {source_root}")
+    imgs = [f for f in os.listdir(IMAGES_DIR)
+            if f.lower().endswith(IMAGE_EXTS)] if os.path.isdir(IMAGES_DIR) else []
+    print(f"  IMAGES_DIR  : {IMAGES_DIR} (exists: {os.path.isdir(IMAGES_DIR)}, "
+          f"wallpapers: {len(imgs)}) {imgs}")
+    print(f"  Pillow      : {'available' if _PIL_AVAILABLE else 'NOT installed'}")
+    print(f"  detected    : name={details['rom_name']!r} version={details['version']!r} "
+          f"android={details['android']!r} date={details['date']!r}")
+    print(f"  {paint('props read:', C.DIM)}")
+    for key in ("ro.build.version.release", "ro.build.version.incremental",
+                "ro.build.display.id", "ro.build.flavor", "ro.product.build.flavor",
+                "ro.build.id", "ro.modversion", "ro.build.date.utc"):
+        if key in props:
+            print(f"    {key} = {props[key]}")
+    for key, value in props.items():
+        if re.match(r"^ro\.[a-z0-9_]+\.(?:build\.|display\.)?version$", key):
+            print(f"    {paint(key, C.YELLOW)} = {value}   <- version-like")
+    print(f"  {paint('────────────────────────────────────────', C.DIM)}\n")
+
+
 def main():
     dry_run = "--dry-run" in sys.argv
 
@@ -832,7 +880,15 @@ def main():
     zip_path = find_latest_zip(PRODUCT_DIR)
     product_dir = os.path.dirname(zip_path)
     props = read_build_props(product_dir)
-    details = detect_rom_details(zip_path, props, find_source_root())
+    source_root = find_source_root()
+    details = detect_rom_details(zip_path, props, source_root)
+
+    if "--debug" in sys.argv:
+        debug_report(props, details, zip_path, source_root)
+
+    if not _PIL_AVAILABLE and not dry_run:
+        print(f"  {paint('⚠ Pillow is not installed — no release image will be attached.', C.YELLOW)}")
+        print(f"  {paint('   Fix it with:  pip install Pillow', C.YELLOW)}")
 
     if not TELEGRAM_TOKEN and not dry_run:
         print(f"  {paint('⚠ TELEGRAM_TOKEN is empty — the post will fail.', C.YELLOW)}")
@@ -885,9 +941,9 @@ def main():
     image_path = None
     background = pick_random_image(IMAGES_DIR)
     if background is None:
-        log(f"No wallpapers in '{IMAGES_DIR}/' — sending text only.")
+        log(paint(f"No wallpapers found in {IMAGES_DIR}/ — sending text only.", C.YELLOW))
     elif not _PIL_AVAILABLE:
-        log("Pillow not installed — skipping the release image (pip install Pillow).")
+        log(paint("Pillow is not installed — skipping the release image.", C.YELLOW))
     else:
         try:
             image_path = make_release_image(background, details["rom_name"])
