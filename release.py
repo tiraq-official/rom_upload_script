@@ -1,365 +1,630 @@
 #!/usr/bin/env python3
 """
-Targeted release script for Moto G34/G45 5G (fogos).
+Dynamic ROM release script for Moto G34/G45 5G (fogos).
 
-After a successful ROM build:
-  1. Finds the newest ROM zip in out/target/product/fogos that belongs to one
-     of the maintained ROMs (Axion OS, Lunaris OS, Voltage OS, Pixelify OS).
-  2. Uploads the ROM + boot/dtbo/vendor_boot images to GoFile and Pixeldrain,
-     and additionally uploads the ROM zip to SourceForge (permanent storage,
-     via rsync) into the ROM's own folder.
-  3. Posts a clean release message to Telegram.
+After a successful ROM build it:
+  1. Picks the newest ROM zip in out/target/product/fogos -- ANY ROM, no
+     whitelist. Whatever you built last is what gets released.
+  2. Works out the ROM name, ROM version and Android version from the build
+     output (build.prop) and the ROM source tree, falling back to the zip
+     filename when those aren't available.
+  3. Uploads the ROM zip + boot / dtbo / vendor_boot images to GoFile and
+     Pixeldrain.
+  4. Posts an accurate release message to Telegram (maintainer: tiraq, build
+     type: always UNOFFICIAL).
 
-SourceForge setup needed on the build machine:
-  - Your SourceForge username in SOURCEFORGE_USER below (or the
-    SOURCEFORGE_USER environment variable).
-  - An SSH key registered at SourceForge (Account > SSH Settings), so rsync
-    can log in without a password prompt.
+The terminal shows a live dashboard: an ASCII "ROM UPLOAD" banner, an
+"auto upload started" line, the list of everything being uploaded with a tick
+appearing as each one finishes, and a moving progress bar at the bottom.
 
-NOTE: Tokens/keys can be overridden with environment variables so you don't
-have to keep them in this file:
-    TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, PIXELDRAIN_API_KEY,
-    SOURCEFORGE_USER, SOURCEFORGE_PROJECT
+Credentials are read from the environment (recommended) or the CONFIG block
+below:
+    TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, PIXELDRAIN_API_KEY
+
+Optional overrides if auto-detection ever gets something wrong:
+    ROM_NAME_OVERRIDE, ROM_VERSION_OVERRIDE, ANDROID_VERSION_OVERRIDE
+
+Run with --dry-run to see detection + the dashboard without uploading
+anything or touching Telegram.
 """
 
 import os
 import re
+import sys
 import glob
 import time
-import subprocess
-from urllib.parse import quote
+import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
 # ==================== CONFIGURATION ====================
-TELEGRAM_TOKEN = os.environ.get(
-    "TELEGRAM_TOKEN",
-    "8860525999:AAFLlMQa0eeuKoamBapct3YJAClTVD_Eqwc"
-)
+# Fill these in here, or better: export them in your shell before running.
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8860525999:AAFLlMQa0eeuKoamBapct3YJAClTVD_Eqwc")          # <-- set me
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1003934445801")
-PIXELDRAIN_API_KEY = os.environ.get(
-    "PIXELDRAIN_API_KEY",
-    "2dfa58b9-27f1-4fb7-b0e6-ba5590fd2ce2"
-)
+PIXELDRAIN_API_KEY = os.environ.get("PIXELDRAIN_API_KEY", "020f0c6c-b756-4d48-a31b-410e1d56f1eb")  # <-- set me
 
-# SourceForge permanent storage (rsync)
-# Uploads land in: /home/frs/project/<project>/<base path>/<rom folder>/
-SOURCEFORGE_USER = os.environ.get("SOURCEFORGE_USER", "tiraq")
-SOURCEFORGE_PROJECT = os.environ.get("SOURCEFORGE_PROJECT", "orb-of-fortune-teller")
-SOURCEFORGE_BASE_PATH = os.environ.get("SOURCEFORGE_BASE_PATH", "fogos")
+MAINTAINER = os.environ.get("MAINTAINER", "tiraq")
+BUILD_TYPE = "UNOFFICIAL"  # always unofficial
 
-# Targeted device
-DEVICE_NAME = "Moto G34/G45 5G (fogos)"
-PRODUCT_DIR = "../out/target/product/fogos"
+DEVICE_NAME = os.environ.get("DEVICE_NAME", "Moto G34/G45 5G (fogos)")
+PRODUCT_DIR = os.environ.get("PRODUCT_DIR", "../out/target/product/fogos")
 
-# ROMs we maintain. Filenames are normalized first (lowercase, all spaces/
-# dots/dashes/underscores stripped), so "LunarisOS", "Lunaris OS",
-# "lunaris_os", "Lunaris-OS" etc. all match the keyword "lunaris".
-# Each ROM also maps to its SourceForge folder inside the project.
-SUPPORTED_ROMS = {
-    "Axion OS": {
-        "keywords": ["axion"],
-        "sf_folder": "axion",
-    },
-    "Lunaris OS": {
-        "keywords": ["lunaris"],
-        "sf_folder": "lunaris",
-    },
-    "Voltage OS": {
-        "keywords": ["voltage"],
-        "sf_folder": "voltage",
-    },
-    "Pixelify OS": {
-        "keywords": ["pixelify", "ascp", "pixelos"],
-        "sf_folder": "pixelify",
-    },
-}
+# Leave empty to auto-detect.
+ROM_NAME_OVERRIDE = os.environ.get("ROM_NAME_OVERRIDE", "")
+ROM_VERSION_OVERRIDE = os.environ.get("ROM_VERSION_OVERRIDE", "")
+ANDROID_VERSION_OVERRIDE = os.environ.get("ANDROID_VERSION_OVERRIDE", "")
 
 MAX_RETRIES = 3
+UPLOAD_WORKERS = 4
 # =======================================================
 
+BANNER = r"""
+██████╗  ██████╗ ███╗   ███╗   ██╗   ██╗██████╗ ██╗      ██████╗  █████╗ ██████╗
+██╔══██╗██╔═══██╗████╗ ████║   ██║   ██║██╔══██╗██║     ██╔═══██╗██╔══██╗██╔══██╗
+██████╔╝██║   ██║██╔████╔██║   ██║   ██║██████╔╝██║     ██║   ██║███████║██║  ██║
+██╔══██╗██║   ██║██║╚██╔╝██║   ██║   ██║██╔═══╝ ██║     ██║   ██║██╔══██║██║  ██║
+██║  ██║╚██████╔╝██║ ╚═╝ ██║   ╚██████╔╝██║     ███████╗╚██████╔╝██║  ██║██████╔╝
+╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝    ╚═════╝ ╚═╝     ╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═════╝
+"""
 
-def normalize_name(text):
-    """Lowercase and strip every separator (spaces, dots, dashes, underscores)."""
-    return re.sub(r"[^a-z0-9]", "", text.lower())
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
-def detect_rom(filename):
-    """Return the display name if the file belongs to a maintained ROM, else None."""
-    normalized = normalize_name(filename)
-    for display_name, info in SUPPORTED_ROMS.items():
-        if any(keyword in normalized for keyword in info["keywords"]):
-            return display_name
+# ---------------------------------------------------------------- terminal
+
+class C:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    WHITE = "\033[97m"
+    HIDE_CURSOR = "\033[?25l"
+    SHOW_CURSOR = "\033[?25h"
+    HOME = "\033[H"
+    CLEAR = "\033[2J"
+    CLR_EOL = "\033[K"
+    CLR_DOWN = "\033[J"
+
+
+def use_color():
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def paint(text, *codes):
+    if not use_color():
+        return text
+    return "".join(codes) + text + C.RESET
+
+
+def fmt_time(sec):
+    sec = int(sec)
+    m, s = divmod(sec, 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def make_bar(frac, width, active, now):
+    """A filled progress bar; while active, a highlight slides along it."""
+    frac = max(0.0, min(1.0, frac))
+    filled = int(round(frac * width))
+    cells = ["█"] * filled + ["░"] * (width - filled)
+    if active and width > 1:
+        pos = int((now * 12) % width)
+        cells[pos] = "▓" if cells[pos] == "█" else "▒"
+    if use_color():
+        bar = "".join(
+            paint(ch, C.CYAN if i < filled else C.DIM) for i, ch in enumerate(cells)
+        )
+    else:
+        bar = "".join(cells)
+    return "[" + bar + "]"
+
+
+class Dashboard:
+    """Live terminal view: banner + upload list + moving progress bar."""
+
+    def __init__(self, items):
+        # items: list of (key, label, sublabel)
+        self._lock = threading.RLock()
+        self._order = [k for k, _, _ in items]
+        self._label = {k: lbl for k, lbl, _ in items}
+        self._sub = {k: sub for k, _, sub in items}
+        self._status = {k: "pending" for k, _, _ in items}
+        self._detail = {k: "" for k, _, _ in items}
+        self._header = []
+        self._start = time.time()
+        self._tty = sys.stdout.isatty()
+        self._stop = threading.Event()
+        self._thread = None
+
+    def set_header(self, lines):
+        with self._lock:
+            self._header = list(lines)
+            if self._tty:
+                self._draw()
+
+    def start(self):
+        if self._tty:
+            sys.stdout.write(C.CLEAR + C.HOME + C.HIDE_CURSOR)
+            sys.stdout.flush()
+            self._thread = threading.Thread(target=self._spin, daemon=True)
+            self._thread.start()
+        else:
+            for line in self._header:
+                print(line)
+
+    def _spin(self):
+        while not self._stop.is_set():
+            with self._lock:
+                self._draw()
+            time.sleep(0.1)
+
+    def update(self, key, status, detail=None):
+        with self._lock:
+            self._status[key] = status
+            if detail is not None:
+                self._detail[key] = detail
+            if self._tty:
+                self._draw()
+            else:
+                sym = {"pending": "○", "active": "…", "done": "✓", "failed": "✗"}
+                line = f"  {sym.get(status, '?')} {self._label[key]}"
+                if detail:
+                    line += f"  {detail}"
+                print(line)
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+        with self._lock:
+            self._draw(final=True)
+        if self._tty:
+            sys.stdout.write(C.SHOW_CURSOR + "\n")
+            sys.stdout.flush()
+
+    def _draw(self, final=False):
+        if not self._tty:
+            return
+        now = time.time()
+        elapsed = now - self._start
+        lines = list(self._header)
+
+        for key in self._order:
+            st = self._status[key]
+            if st == "pending":
+                sym = paint("○", C.DIM)
+            elif st == "active":
+                sym = paint(SPINNER[int(now * 10) % len(SPINNER)], C.CYAN, C.BOLD)
+            elif st == "done":
+                sym = paint("✓", C.GREEN, C.BOLD)
+            else:
+                sym = paint("✗", C.RED, C.BOLD)
+
+            label = self._label[key]
+            detail = self._detail[key]
+            tail = ""
+            if detail:
+                tail = "  " + paint(detail, C.DIM)
+            elif self._sub[key] and self._sub[key] != label:
+                tail = "  " + paint(self._sub[key], C.DIM)
+            lines.append(f"  {sym} {label}{tail}")
+
+        done = sum(1 for k in self._order if self._status[k] in ("done", "failed"))
+        total = max(1, len(self._order))
+        active = any(self._status[k] == "active" for k in self._order)
+        frac = done / total
+        bar = make_bar(frac, 44, active and not final, now)
+        pct = int(round(frac * 100))
+
+        lines.append("")
+        lines.append(
+            f"  {bar}  {paint(str(pct) + '%', C.BOLD, C.CYAN)}"
+            f"   {done}/{total} files   {paint(fmt_time(elapsed), C.DIM)}"
+        )
+        if final:
+            lines.append("")
+            lines.append("  " + paint("✔ All uploads finished.", C.GREEN, C.BOLD))
+
+        frame = C.HOME + "\n".join(l + C.CLR_EOL for l in lines) + C.CLR_DOWN
+        sys.stdout.write(frame)
+        sys.stdout.flush()
+
+
+# ---------------------------------------------------------------- helpers
+
+def log(msg):
+    print(f"  {paint('•', C.DIM)} {msg}")
+
+
+def fail(msg, code=1):
+    print(f"\n  {paint('✗ ' + msg, C.RED, C.BOLD)}\n")
+    sys.exit(code)
+
+
+def human_size(n):
+    val = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if val < 1024 or unit == "TB":
+            return f"{int(val)} B" if unit == "B" else f"{val:.2f} {unit}"
+        val /= 1024
+
+
+# ---------------------------------------------------------------- detection
+
+BUILD_PROP_PATHS = [
+    "system/build.prop",
+    "system/system/build.prop",
+    "vendor/build.prop",
+    "product/build.prop",
+    "odm/build.prop",
+    "system_ext/build.prop",
+    "build.prop",
+]
+
+# Tokens that are never a ROM name in a "ro.<token>.version" key.
+_TOKEN_EXCLUDE = {
+    "build", "product", "vendor", "odm", "system", "system_ext", "board",
+    "boot", "hardware", "kernel", "recovery", "base", "common", "generic",
+    "aosp", "config", "custom", "mod", "display", "incremental", "security",
+    "sdk", "spl", "patch", "feature", "features", "support", "android",
+}
+
+_BRAND_SKIP = {
+    "user", "userdebug", "eng", "test", "release", "official", "unofficial",
+    "aosp", "generic", "unknown", "dev", "debug", "build", "rom",
+}
+
+
+def read_build_props(product_dir):
+    """Merge every build.prop we can find into one dict (first value wins)."""
+    props = {}
+    for rel in BUILD_PROP_PATHS:
+        path = os.path.join(product_dir, rel)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", errors="ignore") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    if key and key not in props:
+                        props[key] = value.strip()
+        except OSError:
+            pass
+    return props
+
+
+def parse_filename(filename, device_slug=None):
+    """Best-effort name / version / android / date from the zip filename."""
+    base = re.sub(r"\.zip$", "", filename, flags=re.I)
+    parts = re.split(r"[-_]", base)
+
+    version = None
+    for part in parts:
+        if re.fullmatch(r"[vV]?\d+\.\d+(\.\d+)?", part):
+            version = part.lstrip("vV")
+            break
+
+    android = None
+    for part in parts:
+        if re.fullmatch(r"[aA]?1[0-9]", part):
+            android = re.sub(r"[aA]", "", part)
+            break
+
+    date = None
+    m = re.search(r"(20\d{6})", base)
+    if m:
+        try:
+            date = datetime.strptime(m.group(1), "%Y%m%d")
+        except ValueError:
+            date = None
+
+    # Name = everything before the first version / android / date token.
+    cut = len(base)
+    for pat in (r"[-_]?[vV]?\d+\.\d+", r"[-_][aA]?1[0-9](?=[-_]|$)", r"[-_]?20\d{6}"):
+        for mm in re.finditer(pat, base):
+            cut = min(cut, mm.start())
+    if device_slug:
+        idx = base.lower().find(device_slug.lower())
+        if idx > 0:
+            cut = min(cut, idx)
+    name = re.sub(r"[_-]+", " ", base[:cut]).strip()
+    return {"name": name or None, "version": version, "android": android, "date": date}
+
+
+def detect_rom_token_version(props):
+    """Find (token, version) from a ROM-specific prop like ro.axion.version."""
+    best = None
+    for key, value in props.items():
+        m = re.match(r"^ro\.([a-z0-9_]+)\.(?:build\.|display\.)?version$", key)
+        if not m:
+            continue
+        token = m.group(1)
+        if token in _TOKEN_EXCLUDE or not re.search(r"\d", value):
+            continue
+        score = 0
+        if any(k.startswith(f"ro.{token}.") for k in props):
+            score += 1
+        if re.match(r"^\d", value):
+            score += 1
+        if best is None or score > best[0]:
+            best = (score, token, value)
+    if best:
+        return best[1], best[2]
+    return None, None
+
+
+def guess_brand(props, token, device_slug, filename=None):
+    """Pick a human ROM name out of the build ids / filename / prop values.
+
+    Candidates are tried in order of trust: the build id/flavor props first,
+    then the zip filename, then any other prop that mentions the ROM token.
+    The first candidate that yields a match wins, so a clean build id is never
+    overridden by a noisier source.
+    """
+    candidates = []
+    for key in ("ro.build.display.id", "ro.build.flavor", "ro.product.build.flavor",
+                "ro.build.id", "ro.modversion", "ro.build.description"):
+        if props.get(key):
+            candidates.append(props[key])
+    if filename:
+        candidates.append(re.sub(r"\.zip$", "", filename, flags=re.I))
+    if token:
+        for key, value in props.items():
+            if token in key.lower() or token in value.lower():
+                candidates.append(value)
+
+    skip = set(_BRAND_SKIP)
+    if device_slug:
+        skip.add(device_slug.lower())
+
+    best_overall = None
+    for text in candidates:
+        bare = None
+        for word in re.findall(r"[A-Za-z][A-Za-z0-9\.]*", text):
+            wl = word.lower()
+            if wl in skip or re.match(r"^v?\d", wl):
+                continue
+            if token:
+                if wl.startswith(token):
+                    if len(wl) > len(token):
+                        return word          # e.g. AxionOS / PixelOS / VoltageOS
+                    bare = bare or word
+            elif best_overall is None or len(word) > len(best_overall):
+                best_overall = word
+        if bare:
+            return bare.title() if bare.islower() else bare
+
+    if token:
+        return token.title()
+    return best_overall
+
+
+def extract_version_from_ids(props):
+    for key in ("ro.build.version.incremental", "ro.build.display.id",
+                "ro.build.id", "ro.modversion"):
+        value = props.get(key)
+        if not value:
+            continue
+        m = re.search(r"[vV]?(\d+\.\d+(?:\.\d+)?)", value)
+        if m:
+            return m.group(1)
     return None
 
 
-def get_latest_rom():
-    """Find the newest ROM zip in the fogos out dir that belongs to a maintained ROM."""
-    zip_files = glob.glob(os.path.join(PRODUCT_DIR, "*.zip"))
-    if not zip_files:
-        print(f"❌ Error: No ZIP files found in {PRODUCT_DIR}")
-        exit(1)
-
-    candidates = []
-    for zip_path in zip_files:
-        rom_name = detect_rom(os.path.basename(zip_path))
-        if rom_name:
-            candidates.append((zip_path, rom_name))
-
-    if not candidates:
-        found = ", ".join(os.path.basename(z) for z in zip_files)
-        print(
-            "❌ Error: No zip matching a maintained ROM "
-            f"({', '.join(SUPPORTED_ROMS)}) was found.\n   Found instead: {found}"
-        )
-        exit(1)
-
-    latest_zip, rom_name = max(candidates, key=lambda c: os.path.getmtime(c[0]))
-    return latest_zip, rom_name
+def detect_android_version(props, filename):
+    if ANDROID_VERSION_OVERRIDE:
+        return ANDROID_VERSION_OVERRIDE
+    for key in ("ro.build.version.release", "ro.system.build.version.release",
+                "ro.build.version.release_or_codename",
+                "ro.vendor.build.version.release"):
+        value = props.get(key)
+        if value:
+            m = re.match(r"^\d+", value)
+            if m:
+                return m.group(0)
+    return parse_filename(filename)["android"] or "N/A"
 
 
-def parse_rom_details(zip_path, rom_display_name):
-    """Extract build details from the zip filename and build.prop."""
-    filename = os.path.basename(zip_path)
-
-    # Version: a token like 2.4 / 15.0 / 3.1.1 (optionally prefixed with 'v')
-    rom_version = None
-    for token in re.split(r"[-_]", filename):
-        if re.fullmatch(r"[vV]?\d+\.\d+(\.\d+)?", token):
-            rom_version = token.lstrip("vV")
-            break
-
-    # OFFICIAL / UNOFFICIAL (check UNOFFICIAL first to avoid substring collision)
-    if "UNOFFICIAL" in filename.upper():
-        build_type = "UNOFFICIAL"
-    elif "OFFICIAL" in filename.upper():
-        build_type = "OFFICIAL"
-    else:
-        build_type = "UNKNOWN"
-
-    # Android version from build.prop
-    android_version = None
-    build_prop_paths = [
-        os.path.join(os.path.dirname(zip_path), "system", "build.prop"),
-        os.path.join(os.path.dirname(zip_path), "vendor", "build.prop"),
-        os.path.join(os.path.dirname(zip_path), "build.prop"),
-    ]
-    for prop_path in build_prop_paths:
-        if os.path.exists(prop_path):
-            try:
-                with open(prop_path, "r", errors="ignore") as f:
-                    match = re.search(r"ro\.build\.version\.release=(\d+)", f.read())
-                    if match:
-                        android_version = match.group(1)
-                        break
-            except Exception:
-                pass
-
-    # Fallback: Android version from the filename (e.g. a "15" or "15.0" token)
-    if not android_version:
-        for token in re.split(r"[-_]", filename):
-            if re.fullmatch(r"[aA]?1[0-9](\.\d+)?", token):
-                android_version = re.sub(r"[aA]", "", token).split(".")[0]
-                break
-
-    # Build date: YYYYMMDD in the filename, else the file's mtime
-    date_match = re.search(r"(20\d{6})", filename)
-    if date_match:
+def detect_build_date(props, zip_path, fname_date):
+    epoch = props.get("ro.build.date.utc")
+    if epoch and epoch.isdigit():
         try:
-            build_date = datetime.strptime(date_match.group(1), "%Y%m%d").strftime("%d-%m-%Y")
-        except ValueError:
-            build_date = datetime.fromtimestamp(os.path.getmtime(zip_path)).strftime("%d-%m-%Y")
-    else:
-        build_date = datetime.fromtimestamp(os.path.getmtime(zip_path)).strftime("%d-%m-%Y")
+            return datetime.fromtimestamp(int(epoch)).strftime("%d-%m-%Y")
+        except (ValueError, OSError, OverflowError):
+            pass
+    if fname_date:
+        return fname_date.strftime("%d-%m-%Y")
+    return datetime.fromtimestamp(os.path.getmtime(zip_path)).strftime("%d-%m-%Y")
 
-    bytes_size = os.path.getsize(zip_path)
-    file_size = f"{bytes_size / (1024 ** 3):.2f} GB"
+
+def find_source_root():
+    """Walk up from cwd looking for the Android source tree root."""
+    cur = os.path.abspath(os.getcwd())
+    for _ in range(8):
+        if os.path.isdir(os.path.join(cur, ".repo")) or \
+           os.path.isdir(os.path.join(cur, "build", "make")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return os.path.abspath(os.path.join(os.getcwd(), ".."))
+
+
+def manifest_brand(source_root, token):
+    """Read the ROM org out of the repo manifest as a last-resort name."""
+    if not source_root:
+        return None
+    paths = []
+    mdir = os.path.join(source_root, ".repo", "manifests")
+    if os.path.isdir(mdir):
+        paths += [os.path.join(mdir, f) for f in os.listdir(mdir) if f.endswith(".xml")]
+    for rel in (".repo/manifest.xml",):
+        p = os.path.join(source_root, rel)
+        if os.path.exists(p):
+            paths.append(p)
+    if not paths:
+        return None
+
+    cleaned = []
+    for path in paths:
+        try:
+            text = open(path, "r", errors="ignore").read()
+        except OSError:
+            continue
+        for url in re.findall(r'fetch\s*=\s*"([^"]+)"', text):
+            seg = url.rstrip("/").split("/")[-1]
+            seg = re.sub(r"(?i)(android[_-]?manifest|manifest|android|platform|vendor)",
+                         "", seg).strip("-_.")
+            seg = re.sub(r"(?i)aosp$", "", seg).strip("-_.")
+            if seg:
+                cleaned.append(seg)
+    if not cleaned:
+        return None
+    if token:
+        for seg in cleaned:
+            if token in seg.lower():
+                return seg
+    return max(set(cleaned), key=cleaned.count)
+
+
+def detect_rom_details(zip_path, props, source_root):
+    filename = os.path.basename(zip_path)
+    device_slug = os.path.basename(os.path.normpath(PRODUCT_DIR)) or "fogos"
+    fname = parse_filename(filename, device_slug)
+    token, token_version = detect_rom_token_version(props)
+
+    name = ROM_NAME_OVERRIDE or guess_brand(props, token, device_slug, filename) \
+        or manifest_brand(source_root, token) or fname["name"]
+
+    version = ROM_VERSION_OVERRIDE or token_version \
+        or extract_version_from_ids(props) or fname["version"]
+
+    android = detect_android_version(props, filename)
+    date = detect_build_date(props, zip_path, fname["date"])
 
     return {
         "filename": filename,
-        "rom_name": rom_display_name,
-        "version": rom_version or "N/A",
-        "type": build_type,
-        "android": android_version or "N/A",
-        "date": build_date,
-        "size": file_size,
+        "rom_name": name or "Unknown ROM",
+        "version": version or "N/A",
+        "type": BUILD_TYPE,
+        "android": android or "N/A",
+        "date": date,
+        "size": human_size(os.path.getsize(zip_path)),
+        "maintainer": MAINTAINER,
     }
 
 
-# ------------------- SourceForge (rsync) -------------------
-
-def sf_relative_path(sf_folder):
-    """Path inside the project files: <base path>/<rom folder> (e.g. fogos/lunaris)."""
-    base = SOURCEFORGE_BASE_PATH.strip("/")
-    return f"{base}/{sf_folder}" if base else sf_folder
-
-
-def sf_remote_path(sf_folder):
-    """rsync destination for a ROM folder on the SourceForge FRS."""
-    return (
-        f"{SOURCEFORGE_USER},{SOURCEFORGE_PROJECT}@frs.sourceforge.net"
-        f":/home/frs/project/{SOURCEFORGE_PROJECT}/{sf_relative_path(sf_folder)}/"
-    )
+def find_latest_zip(product_dir):
+    zips = glob.glob(os.path.join(product_dir, "*.zip"))
+    if not zips:
+        fail(f"No .zip files found in {product_dir}")
+    return max(zips, key=os.path.getmtime)
 
 
-def sf_download_url(sf_folder, filename):
-    """Permanent download URL of an uploaded file on SourceForge."""
-    return (
-        f"https://sourceforge.net/projects/{SOURCEFORGE_PROJECT}"
-        f"/files/{sf_relative_path(sf_folder)}/{quote(filename)}/download"
-    )
-
-
-def upload_rom_to_sourceforge(file_path, sf_folder):
-    """Upload the ROM zip to its SourceForge folder via rsync.
-
-    Returns the permanent download URL, or None if it failed (the release
-    post will then simply fall back to GoFile/Pixeldrain only).
-    """
-    filename = os.path.basename(file_path)
-    print(f"🚀 Starting SourceForge upload: {filename} -> {sf_folder}/ ...")
-    remote = sf_remote_path(sf_folder)
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            result = subprocess.run(
-                [
-                    "rsync",
-                    "-v",
-                    "--partial",
-                    "--progress",
-                    "-e", "ssh -o StrictHostKeyChecking=accept-new",
-                    file_path,
-                    remote,
-                ],
-            )
-            if result.returncode == 0:
-                print(f"✅ SourceForge completed: {filename}")
-                return sf_download_url(sf_folder, filename)
-            raise Exception(f"rsync exited with code {result.returncode}")
-        except FileNotFoundError:
-            print("❌ Error: rsync is not installed on this machine.")
-            return None
-        except Exception as e:
-            print(f"⚠️ SourceForge attempt {attempt} failed: {e}")
-            if attempt == MAX_RETRIES:
-                print("❌ SourceForge upload failed after all retries — continuing without it.")
-                return None
-            time.sleep(10)
-
-
-# ------------------- GoFile / Pixeldrain -------------------
+# ---------------------------------------------------------------- uploads
 
 def upload_file_to_gofile(file_path):
-    """Upload a file to GoFile with automatic server detection."""
-    if not os.path.exists(file_path):
-        return None
     filename = os.path.basename(file_path)
-    print(f"🚀 Starting GoFile upload: {filename}...")
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            server_res = requests.get("https://api.gofile.io/servers", timeout=15)
-            server_res.raise_for_status()
-            server_data = server_res.json()
-            if server_data.get("status") != "ok" or not server_data.get("data", {}).get("servers"):
-                raise Exception("Failed to retrieve GoFile node.")
-            target_server = server_data["data"]["servers"][0]["name"]
-            upload_url = f"https://{target_server}.gofile.io/contents/uploadfile"
-            with open(file_path, "rb") as f:
-                upload_res = requests.post(upload_url, files={"file": f}, timeout=600)
-            upload_res.raise_for_status()
-            upload_data = upload_res.json()
-            if upload_data.get("status") == "ok":
-                print(f"✅ GoFile completed: {filename}")
-                return upload_data["data"]["downloadPage"]
-            raise Exception(f"Server rejected: {upload_data}")
-        except Exception as e:
-            print(f"⚠️ GoFile attempt {attempt} failed for {filename}: {e}")
+            res = requests.get("https://api.gofile.io/servers", timeout=15)
+            res.raise_for_status()
+            data = res.json()
+            servers = data.get("data", {}).get("servers") or []
+            if data.get("status") != "ok" or not servers:
+                raise Exception("could not get a GoFile server")
+            server = servers[0]["name"]
+            with open(file_path, "rb") as fh:
+                up = requests.post(
+                    f"https://{server}.gofile.io/contents/uploadfile",
+                    files={"file": fh}, timeout=600,
+                )
+            up.raise_for_status()
+            up_data = up.json()
+            if up_data.get("status") == "ok":
+                return up_data["data"]["downloadPage"]
+            raise Exception(f"server rejected: {up_data}")
+        except Exception as exc:  # noqa: BLE001 - retried below
             if attempt == MAX_RETRIES:
                 raise
             time.sleep(5)
 
 
 def upload_file_to_pixeldrain(file_path):
-    """Upload a file to Pixeldrain using API key auth (HTTP Basic)."""
-    if not os.path.exists(file_path):
-        return None
-    filename = os.path.basename(file_path)
-    print(f"🚀 Starting Pixeldrain upload: {filename}...")
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            with open(file_path, "rb") as f:
-                upload_res = requests.post(
+            with open(file_path, "rb") as fh:
+                res = requests.post(
                     "https://pixeldrain.com/api/file",
-                    files={"file": f},
+                    files={"file": fh},
                     auth=("", PIXELDRAIN_API_KEY),
                     timeout=600,
                 )
-            upload_res.raise_for_status()
-            upload_data = upload_res.json()
-            if upload_data.get("success") is True:
-                print(f"✅ Pixeldrain completed: {filename}")
-                return f"https://pixeldrain.com/u/{upload_data.get('id')}"
-            raise Exception(f"Pixeldrain rejected: {upload_data}")
-        except Exception as e:
-            print(f"⚠️ Pixeldrain attempt {attempt} failed for {filename}: {e}")
+            res.raise_for_status()
+            data = res.json()
+            if data.get("success") is True:
+                return f"https://pixeldrain.com/u/{data.get('id')}"
+            raise Exception(f"rejected: {data}")
+        except Exception:  # noqa: BLE001 - retried below
             if attempt == MAX_RETRIES:
                 raise
             time.sleep(5)
 
 
-def upload_wrapper(file_path):
-    """Upload one file to both mirrors and return both URLs."""
-    filename = os.path.basename(file_path)
-    gofile_url = upload_file_to_gofile(file_path)
-    pixeldrain_url = upload_file_to_pixeldrain(file_path)
-    return filename, {"gofile": gofile_url or "N/A", "pixeldrain": pixeldrain_url or "N/A"}
+def upload_one(file_path, dash, key, dry_run=False):
+    """Upload one file to both mirrors, updating the dashboard as we go."""
+    name = os.path.basename(file_path)
+    dash.update(key, "active", "uploading to GoFile + Pixeldrain…")
+
+    if dry_run:
+        time.sleep(1.5)
+        dash.update(key, "done", "GoFile + Pixeldrain ✓ (dry run)")
+        return name, {"gofile": "https://gofile.io/d/DRYRUN", "pixeldrain": "https://pixeldrain.com/u/DRYRUN"}
+
+    result = {"gofile": "N/A", "pixeldrain": "N/A"}
+    try:
+        result["gofile"] = upload_file_to_gofile(file_path) or "N/A"
+    except Exception as exc:  # noqa: BLE001
+        log(f"GoFile failed for {name}: {exc}")
+    try:
+        result["pixeldrain"] = upload_file_to_pixeldrain(file_path) or "N/A"
+    except Exception as exc:  # noqa: BLE001
+        log(f"Pixeldrain failed for {name}: {exc}")
+
+    mirrors = [m for m in ("gofile", "pixeldrain") if result[m] != "N/A"]
+    if not mirrors:
+        dash.update(key, "failed", "both mirrors failed")
+    else:
+        dash.update(key, "done", " + ".join(m.capitalize() for m in mirrors) + " ✓")
+    return name, result
 
 
-def upload_all_assets(device_dir, rom_zip_path):
-    """Upload the ROM and images to both mirrors concurrently."""
-    files_to_upload = [
-        rom_zip_path,
-        os.path.join(device_dir, "boot.img"),
-        os.path.join(device_dir, "dtbo.img"),
-        os.path.join(device_dir, "vendor_boot.img"),
-    ]
-    existing_files = [f for f in files_to_upload if os.path.exists(f)]
-    links = {}
-
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        future_to_file = {executor.submit(upload_wrapper, f): f for f in existing_files}
-        for future in as_completed(future_to_file):
-            file_path = future_to_file[future]
-            try:
-                filename, mirror_urls = future.result()
-                links[filename] = mirror_urls
-            except Exception:
-                print(f"❌ Critical Error: Parallel upload pipeline failed for {os.path.basename(file_path)}.")
-                exit(1)
-    return links
-
-
-# ------------------- Telegram post -------------------
+# ---------------------------------------------------------------- telegram
 
 def get_links_str(links, target_name):
-    """Build a 'SourceForge • GoFile • Pixeldrain' string for a file,
-    using whatever mirrors are available."""
     keys = list(links.keys())
     if target_name == "boot.img":
-        # Exclude vendor_boot.img so plain boot.img matches correctly
-        match_key = next((k for k in keys if "boot.img" in k and "vendor" not in k), None)
+        match = next((k for k in keys if "boot.img" in k and "vendor" not in k), None)
     else:
-        match_key = next((k for k in keys if target_name in k), None)
-
-    if not match_key:
+        match = next((k for k in keys if target_name in k), None)
+    if not match:
         return "Not available"
 
-    entry = links[match_key]
+    entry = links[match]
     parts = []
-    if entry.get("sourceforge", "N/A") != "N/A":
-        parts.append(f"[SourceForge]({entry['sourceforge']})")
     if entry.get("gofile", "N/A") != "N/A":
         parts.append(f"[GoFile]({entry['gofile']})")
     if entry.get("pixeldrain", "N/A") != "N/A":
@@ -368,37 +633,42 @@ def get_links_str(links, target_name):
 
 
 def build_message(details, links):
-    """Compose the Telegram release post (safe for non-premium formatting limits)."""
     rom = details["rom_name"]
-    rom_tag = "#" + rom.replace(" ", "")
+    rom_tag = "#" + re.sub(r"[^A-Za-z0-9]", "", rom)
     android_tag = f" #Android{details['android']}" if details["android"] != "N/A" else ""
 
-    # Header line: ROM name + version + build type
-    header = f"{rom} {details['version']}" if details["version"] != "N/A" else rom
-    if details["type"] != "UNKNOWN":
+    header = f"{rom} {details['version']}".strip()
+    if details["type"]:
         header = f"{header} | {details['type']}"
 
-    message = (
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"📦 *{header}*\n"
-        f"📱 *Device*: {DEVICE_NAME}\n\n"
-        f"🤖 Android: `{details['android']}`\n"
-        f"📅 Build Date: `{details['date']}`\n"
-        f"💾 Size: `{details['size']}`\n\n"
-        "⬇️ *Downloads*\n\n"
-        f"*ROM*\n{get_links_str(links, details['filename'])}\n\n"
-        f"*Boot Image*\n{get_links_str(links, 'boot.img')}\n\n"
-        f"*DTBO Image*\n{get_links_str(links, 'dtbo.img')}\n\n"
-        f"*Vendor Boot Image*\n{get_links_str(links, 'vendor_boot.img')}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ Flash at your own risk. Always take a backup before installing.\n"
-        f"#fogos {rom_tag}{android_tag}"
-    )
-    return message
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📦 *{header}*",
+        f"📱 *Device*: {DEVICE_NAME}",
+        "",
+        f"🤖 Android: `{details['android']}`",
+        f"📅 Build Date: `{details['date']}`",
+        f"💾 Size: `{details['size']}`",
+        f"👤 Maintainer: `{details['maintainer']}`",
+        "",
+        "⬇️ *Downloads*",
+        "",
+        f"*ROM*\n{get_links_str(links, details['filename'])}",
+        "",
+        f"*Boot Image*\n{get_links_str(links, 'boot.img')}",
+        "",
+        f"*DTBO Image*\n{get_links_str(links, 'dtbo.img')}",
+        "",
+        f"*Vendor Boot Image*\n{get_links_str(links, 'vendor_boot.img')}",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "⚠️ Flash at your own risk. Always take a backup before installing.",
+        f"#fogos {rom_tag}{android_tag} #{MAINTAINER}",
+    ]
+    return "\n".join(lines)
 
 
 def send_telegram_notification(details, links):
-    """Post the release message to the Telegram channel."""
     message = build_message(details, links)
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -409,40 +679,96 @@ def send_telegram_notification(details, links):
     }
     res = requests.post(url, json=payload, timeout=30)
     if res.status_code == 200:
-        print("📢 Telegram notification sent successfully!")
+        log("Telegram notification sent.")
     else:
-        print(f"❌ Failed to send Telegram notification: {res.text}")
+        log(paint(f"Telegram send failed: {res.text}", C.RED))
+
+
+# ---------------------------------------------------------------- main
+
+def build_header(details, include_banner=True):
+    stamp = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+    lines = [""]
+    if include_banner:
+        lines += [paint(BANNER.rstrip("\n"), C.CYAN, C.BOLD), ""]
+    lines += [
+        f"  {paint('🚀 Auto upload started', C.GREEN, C.BOLD)}  "
+        f"{paint('•  ' + stamp, C.DIM)}",
+        f"  📦 {paint(details['rom_name'], C.BOLD)} "
+        f"{details['version']}  {paint('•', C.DIM)}  Android {details['android']}"
+        f"  {paint('•', C.DIM)}  {details['type']}"
+        f"  {paint('•', C.DIM)}  Maintainer: {details['maintainer']}",
+        f"  📱 {DEVICE_NAME}",
+        "",
+        f"  {paint('Upload queue', C.BOLD)}",
+    ]
+    return lines
 
 
 def main():
-    print("🔍 Scanning for fogos builds...")
-    rom_zip, rom_display_name = get_latest_rom()
-    device_dir = os.path.dirname(rom_zip)
-    print(f"📦 Found {rom_display_name} build: {os.path.basename(rom_zip)}")
+    dry_run = "--dry-run" in sys.argv
 
-    details = parse_rom_details(rom_zip, rom_display_name)
-    sf_folder = SUPPORTED_ROMS[rom_display_name]["sf_folder"]
+    print(paint(BANNER, C.CYAN, C.BOLD))
+    print(f"  {paint('Scanning for the latest fogos build…', C.DIM)}")
 
-    # Upload ROM to SourceForge in parallel with the GoFile/Pixeldrain uploads
-    print("🚀 Uploading assets in parallel (SourceForge + GoFile + Pixeldrain)...")
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        sf_future = executor.submit(upload_rom_to_sourceforge, rom_zip, sf_folder)
-        uploaded_links = upload_all_assets(device_dir, rom_zip)
-        sf_url = sf_future.result()
+    zip_path = find_latest_zip(PRODUCT_DIR)
+    product_dir = os.path.dirname(zip_path)
+    props = read_build_props(product_dir)
+    details = detect_rom_details(zip_path, props, find_source_root())
 
-    if sf_url:
-        uploaded_links.setdefault(details["filename"], {})["sourceforge"] = sf_url
-    else:
-        print("⚠️ Posting without a SourceForge link for this release.")
+    if not TELEGRAM_TOKEN and not dry_run:
+        print(f"  {paint('⚠ TELEGRAM_TOKEN is empty — the post will fail.', C.YELLOW)}")
+    if not PIXELDRAIN_API_KEY and not dry_run:
+        print(f"  {paint('⚠ PIXELDRAIN_API_KEY is empty — Pixeldrain will fail.', C.YELLOW)}")
 
-    links_file = "release_links.txt"
-    with open(links_file, "w") as f:
-        for fname, mirrors in uploaded_links.items():
-            f.write(f"{fname}:\n  SourceForge: {mirrors.get('sourceforge', 'N/A')}\n")
-            f.write(f"  GoFile: {mirrors['gofile']}\n  Pixeldrain: {mirrors['pixeldrain']}\n")
-    print(f"📝 Saved links locally to {links_file}")
+    # Which assets exist?
+    candidates = [
+        ("rom", "ROM package", zip_path),
+        ("boot", "Boot image", os.path.join(product_dir, "boot.img")),
+        ("dtbo", "DTBO image", os.path.join(product_dir, "dtbo.img")),
+        ("vboot", "Vendor boot image", os.path.join(product_dir, "vendor_boot.img")),
+    ]
+    items = [(k, lbl, os.path.basename(p)) for k, lbl, p in candidates if os.path.exists(p)]
+    paths = {k: p for k, _, p in candidates}
 
-    send_telegram_notification(details, uploaded_links)
+    if not items:
+        fail("Nothing to upload.")
+
+    dash = Dashboard(items)
+    # In a real terminal the dashboard redraws the banner itself; when output is
+    # piped/logged we already printed it above, so don't repeat it.
+    dash.set_header(build_header(details, include_banner=sys.stdout.isatty()))
+    dash.start()
+
+    links = {}
+    with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as pool:
+        futures = {
+            pool.submit(upload_one, paths[k], dash, k, dry_run): k for k, _, _ in items
+        }
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                name, result = future.result()
+                links[name] = result
+            except Exception as exc:  # noqa: BLE001
+                log(f"upload crashed for {key}: {exc}")
+                dash.update(key, "failed", "crashed")
+
+    dash.stop()
+
+    with open("release_links.txt", "w") as fh:
+        for fname, mirrors in links.items():
+            fh.write(f"{fname}:\n")
+            fh.write(f"  GoFile: {mirrors.get('gofile', 'N/A')}\n")
+            fh.write(f"  Pixeldrain: {mirrors.get('pixeldrain', 'N/A')}\n")
+    log("Saved links to release_links.txt")
+
+    if dry_run:
+        log("Dry run — Telegram post skipped. Message would be:\n")
+        print(build_message(details, links))
+        return
+
+    send_telegram_notification(details, links)
 
 
 if __name__ == "__main__":
