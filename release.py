@@ -10,8 +10,9 @@ After a successful ROM build it:
      filename when those aren't available.
   3. Uploads the ROM zip + boot / dtbo / vendor_boot images to GoFile and
      Pixeldrain.
-  4. Posts an accurate release message to Telegram (maintainer: tiraq, build
-     type: always UNOFFICIAL).
+  4. Picks one wallpaper at random from the image folder, stamps the ROM name
+     onto it in white, and attaches it to an accurate release message posted to
+     Telegram (maintainer: tiraq, build type: always UNOFFICIAL).
 
 The terminal shows a live dashboard: an ASCII "ROM UPLOAD" banner, an
 "auto upload started" line, the list of everything being uploaded with a tick
@@ -33,17 +34,25 @@ import re
 import sys
 import glob
 import time
+import random
 import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
+try:  # optional: only needed to stamp the ROM name onto a release image
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
 # ==================== CONFIGURATION ====================
 # Fill these in here, or better: export them in your shell before running.
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8860525999:AAFLlMQa0eeuKoamBapct3YJAClTVD_Eqwc")          # <-- set me
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1003934445801")
 PIXELDRAIN_API_KEY = os.environ.get("PIXELDRAIN_API_KEY", "020f0c6c-b756-4d48-a31b-410e1d56f1eb")  # <-- set me
+
 
 MAINTAINER = os.environ.get("MAINTAINER", "tiraq")
 BUILD_TYPE = "UNOFFICIAL"  # always unofficial
@@ -55,6 +64,12 @@ PRODUCT_DIR = os.environ.get("PRODUCT_DIR", "../out/target/product/fogos")
 ROM_NAME_OVERRIDE = os.environ.get("ROM_NAME_OVERRIDE", "")
 ROM_VERSION_OVERRIDE = os.environ.get("ROM_VERSION_OVERRIDE", "")
 ANDROID_VERSION_OVERRIDE = os.environ.get("ANDROID_VERSION_OVERRIDE", "")
+
+# Release image: one wallpaper is chosen at random from this folder, the ROM
+# name is stamped on it in white, and it is attached to the Telegram post.
+IMAGES_DIR = os.environ.get("IMAGES_DIR", "release_images")
+FONT_PATH = os.environ.get("FONT_PATH", "")  # custom .ttf; empty = auto-pick
+TEXT_Y_FRACTION = 0.5  # where the ROM name sits (0 = top, 1 = bottom)
 
 MAX_RETRIES = 3
 UPLOAD_WORKERS = 4
@@ -612,6 +627,71 @@ def upload_one(file_path, dash, key, dry_run=False):
     return name, result
 
 
+# ---------------------------------------------------------------- release image
+
+FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "C:\\Windows\\Fonts\\arialbd.ttf",
+]
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+
+
+def load_font(size):
+    """A bold sans font for the ROM name, falling back to whatever exists."""
+    for path in ([FONT_PATH] if FONT_PATH else []) + FONT_CANDIDATES:
+        if path and os.path.isfile(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                continue
+    for name in ("DejaVuSans-Bold.ttf", "arial.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def pick_random_image(images_dir):
+    """Return a random wallpaper from the folder, or None if there are none."""
+    if not os.path.isdir(images_dir):
+        return None
+    files = [os.path.join(images_dir, f) for f in os.listdir(images_dir)
+             if f.lower().endswith(IMAGE_EXTS)]
+    return random.choice(files) if files else None
+
+
+def make_release_image(bg_path, rom_name, out_path="release_image.jpg"):
+    """Stamp the ROM name in white onto a copy of the wallpaper."""
+    img = Image.open(bg_path).convert("RGBA")
+    width, height = img.size
+    size = max(28, int(width * 0.10))
+    font = load_font(size)
+
+    bbox = ImageDraw.Draw(img).textbbox((0, 0), rom_name, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    x = (width - tw) // 2 - bbox[0]
+    y = int(height * TEXT_Y_FRACTION) - th // 2 - bbox[1]
+
+    # A soft drop shadow keeps the white text readable over bright artwork.
+    shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).text(
+        (x + size * 0.05, y + size * 0.05), rom_name, font=font, fill=(0, 0, 0, 190)
+    )
+    shadow = shadow.filter(ImageFilter.GaussianBlur(size * 0.035))
+    img = Image.alpha_composite(img, shadow)
+
+    ImageDraw.Draw(img).text((x, y), rom_name, font=font, fill=(255, 255, 255, 255))
+    img.convert("RGB").save(out_path, "JPEG", quality=92)
+    return out_path
+
+
 # ---------------------------------------------------------------- telegram
 
 def get_links_str(links, target_name):
@@ -668,8 +748,7 @@ def build_message(details, links):
     return "\n".join(lines)
 
 
-def send_telegram_notification(details, links):
-    message = build_message(details, links)
+def send_telegram_text(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -679,9 +758,48 @@ def send_telegram_notification(details, links):
     }
     res = requests.post(url, json=payload, timeout=30)
     if res.status_code == 200:
-        log("Telegram notification sent.")
+        log("Telegram message sent.")
     else:
         log(paint(f"Telegram send failed: {res.text}", C.RED))
+
+
+def send_telegram_photo(image_path, caption):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    try:
+        with open(image_path, "rb") as fh:
+            res = requests.post(
+                url,
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption,
+                      "parse_mode": "Markdown"},
+                files={"photo": fh},
+                timeout=120,
+            )
+        if res.status_code == 200:
+            return True
+        log(paint(f"sendPhoto failed: {res.text}", C.RED))
+    except Exception as exc:  # noqa: BLE001
+        log(paint(f"sendPhoto error: {exc}", C.RED))
+    return False
+
+
+def send_telegram_notification(details, links, image_path=None):
+    """Post the release. Attach the stamped image when we have one."""
+    message = build_message(details, links)
+
+    if image_path and os.path.isfile(image_path):
+        if len(message) <= 1024:  # Telegram's photo-caption limit
+            if send_telegram_photo(image_path, message):
+                log("Telegram photo + release message sent.")
+                return
+        else:
+            # Too long for a caption: photo first, full details as a message.
+            short = (f"📦 *{details['rom_name']} {details['version']} | "
+                     f"{details['type']}*\n📱 {DEVICE_NAME}\n"
+                     f"🤖 Android {details['android']}")
+            send_telegram_photo(image_path, short)
+            log("Photo sent; posting the full details as text.")
+
+    send_telegram_text(message)
 
 
 # ---------------------------------------------------------------- main
@@ -763,12 +881,27 @@ def main():
             fh.write(f"  Pixeldrain: {mirrors.get('pixeldrain', 'N/A')}\n")
     log("Saved links to release_links.txt")
 
+    # Pick a random wallpaper and stamp the ROM name onto it.
+    image_path = None
+    background = pick_random_image(IMAGES_DIR)
+    if background is None:
+        log(f"No wallpapers in '{IMAGES_DIR}/' — sending text only.")
+    elif not _PIL_AVAILABLE:
+        log("Pillow not installed — skipping the release image (pip install Pillow).")
+    else:
+        try:
+            image_path = make_release_image(background, details["rom_name"])
+            log(f"Release image: {os.path.basename(background)} "
+                f"+ \"{details['rom_name']}\" -> {image_path}")
+        except Exception as exc:  # noqa: BLE001
+            log(f"Could not build the release image: {exc}")
+
     if dry_run:
         log("Dry run — Telegram post skipped. Message would be:\n")
         print(build_message(details, links))
         return
 
-    send_telegram_notification(details, links)
+    send_telegram_notification(details, links, image_path)
 
 
 if __name__ == "__main__":
