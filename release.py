@@ -72,8 +72,8 @@ ANDROID_VERSION_OVERRIDE = os.environ.get("ANDROID_VERSION_OVERRIDE", "")
 # Resolved next to release.py, not relative to the shell's cwd, so it works
 # no matter which directory you launch the script from.
 IMAGES_DIR = os.environ.get("IMAGES_DIR", os.path.join(SCRIPT_DIR, "release_images"))
-FONT_PATH = os.environ.get("FONT_PATH", "")  # custom .ttf; empty = auto-pick
-TEXT_Y_FRACTION = 0.5  # where the ROM name sits (0 = top, 1 = bottom)
+FONT_PATH = os.environ.get("FONT_PATH", "Luckies.ttf")  # custom .ttf; empty = auto-pick
+TEXT_Y_FRACTION = 0.9  # where the ROM name sits (0 = top, 1 = bottom)
 
 MAX_RETRIES = 3
 UPLOAD_WORKERS = 4
