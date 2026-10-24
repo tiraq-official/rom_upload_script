@@ -71,10 +71,10 @@ ANDROID_VERSION_OVERRIDE = os.environ.get("ANDROID_VERSION_OVERRIDE", "")
 # Resolved next to release.py, not relative to the shell's cwd, so it works
 # no matter which directory you launch the script from.
 IMAGES_DIR = os.environ.get("IMAGES_DIR", os.path.join(SCRIPT_DIR, "release_images"))
-FONT_PATH = os.environ.get("FONT_PATH", "")  # custom .ttf; empty = auto-pick
+FONT_PATH = os.environ.get("FONT_PATH", "Luckies.ttf")  # custom .ttf; empty = auto-pick
 TEXT_Y_FRACTION = 0.5      # vertical position of the name (0 = top, 1 = bottom)
 TEXT_X_FRACTION = 0.06     # left margin; the name is left-aligned
-TEXT_SIZE_FRACTION = 0.15  # font height as a fraction of the image width
+TEXT_SIZE_FRACTION = 0.5  # font height as a fraction of the image width
 
 MAX_RETRIES = 3
 UPLOAD_WORKERS = 4

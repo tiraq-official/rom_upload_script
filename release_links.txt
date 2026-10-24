@@ -1,0 +1,12 @@
+dtbo.img:
+  GoFile: https://gofile.io/d/b8C0EpAs
+  Pixeldrain: https://pixeldrain.com/u/7fNrRJTX
+vendor_boot.img:
+  GoFile: https://gofile.io/d/bPCvZFFA
+  Pixeldrain: https://pixeldrain.com/u/nXi2b65k
+boot.img:
+  GoFile: https://gofile.io/d/T0J79zvV
+  Pixeldrain: https://pixeldrain.com/u/eY8HWWMv
+axion-2.9-NOESIS-20261022-UNOFFICIAL-PICO-fogos.zip:
+  GoFile: https://gofile.io/d/iF9sfVcY
+  Pixeldrain: https://pixeldrain.com/u/3QyQQa8a
