@@ -55,7 +55,6 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8860525999:AAFLlMQa0eeuKoamBa
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1003934445801")
 PIXELDRAIN_API_KEY = os.environ.get("PIXELDRAIN_API_KEY", "020f0c6c-b756-4d48-a31b-410e1d56f1eb")  # <-- set me
 
-
 MAINTAINER = os.environ.get("MAINTAINER", "tiraq")
 BUILD_TYPE = "UNOFFICIAL"  # always unofficial
 
@@ -72,8 +71,10 @@ ANDROID_VERSION_OVERRIDE = os.environ.get("ANDROID_VERSION_OVERRIDE", "")
 # Resolved next to release.py, not relative to the shell's cwd, so it works
 # no matter which directory you launch the script from.
 IMAGES_DIR = os.environ.get("IMAGES_DIR", os.path.join(SCRIPT_DIR, "release_images"))
-FONT_PATH = os.environ.get("FONT_PATH", "Luckies.ttf")  # custom .ttf; empty = auto-pick
-TEXT_Y_FRACTION = 0.9  # where the ROM name sits (0 = top, 1 = bottom)
+FONT_PATH = os.environ.get("FONT_PATH", "")  # custom .ttf; empty = auto-pick
+TEXT_Y_FRACTION = 0.5      # vertical position of the name (0 = top, 1 = bottom)
+TEXT_X_FRACTION = 0.06     # left margin; the name is left-aligned
+TEXT_SIZE_FRACTION = 0.15  # font height as a fraction of the image width
 
 MAX_RETRIES = 3
 UPLOAD_WORKERS = 4
@@ -692,15 +693,25 @@ def pick_random_image(images_dir):
 
 
 def make_release_image(bg_path, rom_name, out_path="release_image.jpg"):
-    """Stamp the ROM name in white onto a copy of the wallpaper."""
+    """Stamp the ROM name in white, left-aligned, onto a copy of the wallpaper."""
     img = Image.open(bg_path).convert("RGBA")
     width, height = img.size
-    size = max(28, int(width * 0.10))
-    font = load_font(size)
+    margin = int(width * TEXT_X_FRACTION)
+    probe = ImageDraw.Draw(img)
 
-    bbox = ImageDraw.Draw(img).textbbox((0, 0), rom_name, font=font)
+    # Start big, then shrink only if the name would spill past the right edge.
+    size = max(28, int(width * TEXT_SIZE_FRACTION))
+    font = load_font(size)
+    while size > 28:
+        box = probe.textbbox((0, 0), rom_name, font=font)
+        if box[2] - box[0] <= width - 2 * margin:
+            break
+        size = int(size * 0.92)
+        font = load_font(size)
+
+    bbox = probe.textbbox((0, 0), rom_name, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    x = (width - tw) // 2 - bbox[0]
+    x = margin - bbox[0]                      # left-aligned
     y = int(height * TEXT_Y_FRACTION) - th // 2 - bbox[1]
 
     # A soft drop shadow keeps the white text readable over bright artwork.
