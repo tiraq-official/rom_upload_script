@@ -2,26 +2,6 @@
 """
 Dynamic ROM release & upload script for Moto G34/G45 5G (fogos).
 
-Features:
-  1. Scans the server for the Android ROM source root and the latest
-     out/target/product/fogos build output.
-  2. Picks the newest FULL ROM zip (ignoring incremental, OTA, fastboot,
-     and target-files zips) along with boot.img and dtbo.img.
-  3. Detects ROM name, version, Android version, build date, and build time
-     from build.prop, source manifest, and filename.
-  4. Streams uploads at full server bandwidth (4 MB chunked streaming +
-     parallel workers) to both Pixeldrain and GoFile, retrying any failed
-     upload up to 3 times. If any upload still fails, stops immediately with
-     "Something's wrong, try again later."
-  5. Displays a terminal UI: ROM-UPLOAD ASCII banner, detected ROM info,
-     loading screen, live per-file upload progress bars + speeds, and prints
-     all final links.
-  6. Posts a compact, minimal Telegram release message with:
-       - Minimal ASCII art ROM banner (strictly <= 41 chars per line)
-       - Build time, date, Unofficial tag, "by tiraq"
-       - Short flashing warning
-       - Download-only inline URL buttons (Pixeldrain & GoFile)
-
 Usage:
   python3 release.py            # full scan, upload, and Telegram post
   python3 release.py --dry-run  # test detection, UI, and Telegram preview
