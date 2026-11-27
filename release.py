@@ -2,6 +2,26 @@
 """
 Dynamic ROM release & upload script for Moto G34/G45 5G (fogos).
 
+Features:
+  1. Scans the server for the Android ROM source root and the latest
+     out/target/product/fogos build output.
+  2. Picks the newest FULL ROM zip (ignoring incremental, OTA, fastboot,
+     and target-files zips) along with boot.img and dtbo.img.
+  3. Detects ROM name, version, Android version, build date, and build time
+     from build.prop, source manifest, and filename.
+  4. Streams uploads at full server bandwidth (4 MB chunked streaming +
+     parallel workers) to both Pixeldrain and GoFile, retrying any failed
+     upload up to 3 times. If any upload still fails, stops immediately with
+     "Something's wrong, try again later."
+  5. Displays a terminal UI: ROM-UPLOAD ASCII banner, detected ROM info,
+     loading screen, live per-file upload progress bars + speeds, and prints
+     all final links.
+  6. Posts a compact, minimal Telegram release message with:
+       - Minimal ASCII art ROM banner (strictly <= 41 chars per line)
+       - Build time, date, Unofficial tag, "by tiraq"
+       - Short flashing warning
+       - Download-only inline URL buttons (Pixeldrain & GoFile)
+
 Usage:
   python3 release.py            # full scan, upload, and Telegram post
   python3 release.py --dry-run  # test detection, UI, and Telegram preview
@@ -299,24 +319,27 @@ class UploadDashboard:
 # ---------------------------------------------------------------- ROM discovery
 
 def is_non_full_zip(path):
-    """Return True for incremental, OTA, fastboot, or target-files zips."""
+    """Return True for incremental, fastboot, or target-files zips."""
     name = os.path.basename(path).lower()
-    if any(tok in name for tok in (
+    return any(tok in name for tok in (
         "incremental", "target_files", "target-files",
         "-img.zip", "fastboot", "super_empty", "symbols",
-    )):
-        return True
-    if re.search(r"(?:^|[-_.])ota(?:[-_.]|$)", name):
-        return True
-    return False
+    ))
+
+
+def _has_ota_token(path):
+    name = os.path.basename(path).lower()
+    return bool(re.search(r"(?:^|[-_.])ota(?:[-_.]|$)", name))
 
 
 def find_latest_full_zip(product_dir):
     zips = glob.glob(os.path.join(product_dir, "*.zip"))
-    full_zips = [z for z in zips if not is_non_full_zip(z)]
-    if not full_zips:
+    candidates = [z for z in zips if not is_non_full_zip(z)]
+    if not candidates:
         return None
-    return max(full_zips, key=os.path.getmtime)
+    # Prefer non-OTA-named zips (e.g. Lineage/Lunaris), but allow <rom>_<device>-ota.zip (e.g. AOSPA)
+    non_ota = [z for z in candidates if not _has_ota_token(z)]
+    return max(non_ota or candidates, key=os.path.getmtime)
 
 
 def _walk_up_for_root(start_dir, max_levels=8):
@@ -510,6 +533,7 @@ def parse_filename(filename, device_slug=DEVICE_CODENAME):
         if idx > 0:
             cut = min(cut, idx)
     name = re.sub(r"[_-]+", " ", base[:cut]).strip()
+    name = re.sub(r"\b(?:ota|unofficial|official|vanilla|gapps)\b", "", name, flags=re.I).strip()
     return {"name": name or None, "version": version, "android": android, "date": date}
 
 
@@ -521,7 +545,9 @@ def detect_rom_token_version(props, filename=None):
         if not m:
             continue
         token = m.group(1)
-        if token in _TOKEN_EXCLUDE or not re.search(r"\d", value):
+        if token in _TOKEN_EXCLUDE:
+            continue
+        if not re.search(r"\d", value) and token not in ("aospa", "paranoid"):
             continue
         siblings = sum(1 for k in props if k.startswith(f"ro.{token}."))
         in_haystack = token in haystack
@@ -534,6 +560,8 @@ def detect_rom_token_version(props, filename=None):
 
 
 def _nice_brand(text):
+    if text and text.lower() == "aospa":
+        return "Paranoid Android"
     if text and text.islower() and " " not in text:
         return text.title()
     return text
@@ -896,6 +924,12 @@ _ROM_NOISE_WORDS = {
 }
 
 
+_ROM_ALIASES = {
+    "aospa": ["paranoid"],
+    "paranoid": ["aospa"],
+}
+
+
 def _normalize_rom_tokens(text):
     spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
     words = re.findall(r"[a-z0-9]+", spaced.lower())
@@ -924,6 +958,10 @@ def _score_banner_candidate(rom_name, file_path):
         return 80.0
     if rom_core_str in file_core_str or file_core_str in rom_core_str:
         return 68.0
+    for tok in rom_core:
+        for alias in _ROM_ALIASES.get(tok, ()):
+            if alias in file_core or alias in file_core_str:
+                return 85.0
     return difflib.SequenceMatcher(None, rom_core_str, file_core_str).ratio() * 60.0
 
 
